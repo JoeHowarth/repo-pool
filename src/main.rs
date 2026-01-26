@@ -459,17 +459,27 @@ fn cmd_checkout(branch: String, no_submodules: bool) -> Result<()> {
     let mut state = load_state()?;
     let pool_state = state.pools.entry(pool_name.clone()).or_default();
 
-    // Check if branch is already assigned
-    for (_clone_name, clone_state) in &mut pool_state.clones {
-        if clone_state.assigned_branch.as_ref() == Some(&branch) {
-            clone_state.last_used = Utc::now();
-            let path = clone_state.path.clone();
-            save_state(&state)?;
+    // Check if branch is already assigned to a clone
+    let existing = pool_state
+        .clones
+        .iter()
+        .find(|(_, cs)| cs.assigned_branch.as_ref() == Some(&branch))
+        .map(|(name, cs)| (name.clone(), cs.path.clone()));
 
-            // Output just the path for shell integration
-            println!("{}", path.display());
-            return Ok(());
-        }
+    if let Some((clone_name, path)) = existing {
+        eprintln!("Branch '{}' already on clone: {}", branch, clone_name);
+
+        // Update last_used
+        pool_state
+            .clones
+            .get_mut(&clone_name)
+            .unwrap()
+            .last_used = Utc::now();
+        save_state(&state)?;
+
+        // Output path for shell integration
+        println!("{}", path.display());
+        return Ok(());
     }
 
     // Find an unassigned clone or the LRU one
