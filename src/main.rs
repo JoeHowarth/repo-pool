@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -261,8 +261,7 @@ fn copy_dev_configs(source: &Path, target: &Path) -> Result<()> {
         let src = source.join(file);
         let dst = target.join(file);
         if src.exists() && src.is_file() {
-            std::fs::copy(&src, &dst)
-                .with_context(|| format!("Failed to copy {}", file))?;
+            std::fs::copy(&src, &dst).with_context(|| format!("Failed to copy {}", file))?;
             eprintln!("  Copied {}", file);
         }
     }
@@ -272,8 +271,7 @@ fn copy_dev_configs(source: &Path, target: &Path) -> Result<()> {
         let src = source.join(dir);
         let dst = target.join(dir);
         if src.exists() && src.is_dir() {
-            copy_dir_recursive(&src, &dst)
-                .with_context(|| format!("Failed to copy {}", dir))?;
+            copy_dir_recursive(&src, &dst).with_context(|| format!("Failed to copy {}", dir))?;
             eprintln!("  Copied {}/", dir);
         }
     }
@@ -388,14 +386,11 @@ fn cmd_init(
                 // Check if it's a clone of the same repo
                 if let Ok(url) = get_remote_url(&path) {
                     if url.contains(&pool_name) || config.pools[&pool_name].repo_url == url {
-                        let clone_name = path
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .to_string();
+                        let clone_name = path.file_name().unwrap().to_string_lossy().to_string();
 
                         // Get current branch
-                        let branch = run_git_output(&["rev-parse", "--abbrev-ref", "HEAD"], &path).ok();
+                        let branch =
+                            run_git_output(&["rev-parse", "--abbrev-ref", "HEAD"], &path).ok();
 
                         pool_state.clones.insert(
                             clone_name.clone(),
@@ -470,11 +465,7 @@ fn cmd_checkout(branch: String, no_submodules: bool) -> Result<()> {
         eprintln!("Branch '{}' already on clone: {}", branch, clone_name);
 
         // Update last_used
-        pool_state
-            .clones
-            .get_mut(&clone_name)
-            .unwrap()
-            .last_used = Utc::now();
+        pool_state.clones.get_mut(&clone_name).unwrap().last_used = Utc::now();
         save_state(&state)?;
 
         // Output path for shell integration
@@ -530,7 +521,10 @@ fn cmd_checkout(branch: String, no_submodules: bool) -> Result<()> {
     let checkout_result = run_git(&["checkout", &branch], &path);
     if checkout_result.is_err() {
         // Try to create tracking branch
-        run_git(&["checkout", "-b", &branch, &format!("origin/{}", branch)], &path)?;
+        run_git(
+            &["checkout", "-b", &branch, &format!("origin/{}", branch)],
+            &path,
+        )?;
     } else {
         // Pull latest
         let _ = run_git(&["pull", "--ff-only"], &path);
@@ -657,7 +651,13 @@ fn cmd_pr(number: u64) -> Result<()> {
     );
 
     let output = Command::new("curl")
-        .args(["-s", "-L", "-H", "Accept: application/vnd.github+json", &url])
+        .args([
+            "-s",
+            "-L",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &url,
+        ])
         .output()
         .context("Failed to fetch PR info")?;
 
@@ -734,11 +734,7 @@ fn cmd_new(name: Option<String>) -> Result<()> {
     eprintln!("  Path: {}", clone_path.display());
 
     // Find a reference repo for --reference
-    let reference = pool_state
-        .clones
-        .values()
-        .next()
-        .map(|cs| cs.path.clone());
+    let reference = pool_state.clones.values().next().map(|cs| cs.path.clone());
 
     // Clone with --reference if possible
     let mut args = vec!["clone"];
@@ -761,7 +757,10 @@ fn cmd_new(name: Option<String>) -> Result<()> {
 
     // Initialize submodules
     eprintln!("Initializing submodules...");
-    run_git(&["submodule", "update", "--init", "--recursive"], &clone_path)?;
+    run_git(
+        &["submodule", "update", "--init", "--recursive"],
+        &clone_path,
+    )?;
 
     // Add to state
     pool_state.clones.insert(
