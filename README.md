@@ -29,6 +29,15 @@ rpool init
 
 This creates a pool configuration and detects existing clones in the parent directory.
 
+### Options
+
+```bash
+rpool init --build-cmd "make"           # custom build command
+rpool init --build-cmd "npm run build"  # for JS projects
+rpool init --base ~/projects            # custom base directory
+rpool init --name mypool                # custom pool name
+```
+
 Add more clones to the pool:
 
 ```bash
@@ -45,13 +54,14 @@ rp st               # show pool status
 rp drop             # unassign current clone for reuse
 rp sync             # fetch all clones
 rp pools            # list configured pools
+rp build            # run configured build command
 ```
 
 ## How it works
 
 1. `rpool init` registers the current repo's parent directory as a pool
 2. Clones in that directory with matching remotes are tracked
-3. `rp ck <branch>` finds an available clone (unassigned or LRU), checks out the branch, updates submodules, and runs `cargo build`
+3. `rp ck <branch>` finds an available clone (unassigned or LRU), checks out the branch, updates submodules, and runs the configured build command
 4. Clones stay assigned to branches until explicitly dropped
 5. If all clones are assigned, the least recently used one is reassigned
 
