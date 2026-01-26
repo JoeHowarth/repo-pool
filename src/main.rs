@@ -71,6 +71,7 @@ enum Commands {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Default)]
 struct Config {
     pools: HashMap<String, PoolConfig>,
 }
@@ -93,6 +94,7 @@ fn default_build_command() -> String {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Default)]
 struct State {
     pools: HashMap<String, PoolState>,
 }
@@ -109,21 +111,7 @@ struct CloneState {
     last_used: DateTime<Utc>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            pools: HashMap::new(),
-        }
-    }
-}
 
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            pools: HashMap::new(),
-        }
-    }
-}
 
 fn config_dir() -> Result<PathBuf> {
     let dir = dirs::config_dir()
