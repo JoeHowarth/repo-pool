@@ -250,6 +250,73 @@ fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
+/// Files/directories to copy between clones (often gitignored dev configs)
+const DEV_CONFIG_FILES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
+const DEV_CONFIG_DIRS: &[&str] = &[".cargo"];
+
+/// Copy dev config files from source clone to target clone
+fn copy_dev_configs(source: &Path, target: &Path) -> Result<()> {
+    // Copy individual files
+    for file in DEV_CONFIG_FILES {
+        let src = source.join(file);
+        let dst = target.join(file);
+        if src.exists() && src.is_file() {
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("Failed to copy {}", file))?;
+            eprintln!("  Copied {}", file);
+        }
+    }
+
+    // Copy directories
+    for dir in DEV_CONFIG_DIRS {
+        let src = source.join(dir);
+        let dst = target.join(dir);
+        if src.exists() && src.is_dir() {
+            copy_dir_recursive(&src, &dst)
+                .with_context(|| format!("Failed to copy {}", dir))?;
+            eprintln!("  Copied {}/", dir);
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Find a clone that has dev config files to copy from
+fn find_dev_config_source(pool_state: &PoolState, exclude: &Path) -> Option<PathBuf> {
+    for clone_state in pool_state.clones.values() {
+        if clone_state.path == exclude {
+            continue;
+        }
+        // Check if this clone has any dev config files
+        for file in DEV_CONFIG_FILES {
+            if clone_state.path.join(file).exists() {
+                return Some(clone_state.path.clone());
+            }
+        }
+        for dir in DEV_CONFIG_DIRS {
+            if clone_state.path.join(dir).exists() {
+                return Some(clone_state.path.clone());
+            }
+        }
+    }
+    None
+}
+
 fn cmd_init(
     repo: Option<String>,
     base: Option<PathBuf>,
@@ -429,8 +496,7 @@ fn cmd_checkout(branch: String, no_submodules: bool) -> Result<()> {
         }
     };
 
-    let clone_state = pool_state.clones.get_mut(&clone_name).unwrap();
-    let path = clone_state.path.clone();
+    let path = pool_state.clones[&clone_name].path.clone();
 
     // Check for uncommitted changes
     if has_uncommitted_changes(&path)? {
@@ -439,6 +505,9 @@ fn cmd_checkout(branch: String, no_submodules: bool) -> Result<()> {
             clone_name
         );
     }
+
+    // Find dev config source before we start modifying things
+    let dev_config_source = find_dev_config_source(pool_state, &path);
 
     eprintln!("Using clone: {}", clone_name);
 
@@ -462,7 +531,16 @@ fn cmd_checkout(branch: String, no_submodules: bool) -> Result<()> {
         run_git(&["submodule", "update", "--init", "--recursive"], &path)?;
     }
 
+    // Copy dev config files from another clone if available
+    if let Some(source) = dev_config_source {
+        eprintln!("Copying dev configs from {}...", source.display());
+        if let Err(e) = copy_dev_configs(&source, &path) {
+            eprintln!("  Warning: {}", e);
+        }
+    }
+
     // Update state
+    let clone_state = pool_state.clones.get_mut(&clone_name).unwrap();
     clone_state.assigned_branch = Some(branch);
     clone_state.last_used = Utc::now();
     save_state(&state)?;
