@@ -65,6 +65,14 @@ rp build            # run configured build command
 4. Clones stay assigned to branches until explicitly dropped
 5. If all clones are assigned, the least recently used one is reassigned
 
+## Dev config files
+
+On checkout, rpool automatically copies these files from another clone in the pool (useful for gitignored dev configs):
+
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.cargo/` directory
+
 ## Files
 
 - `~/.config/rpool/config.json` - pool configurations
