@@ -26,6 +26,9 @@ enum Commands {
         /// Name for this pool (default: repo name)
         #[arg(short, long)]
         name: Option<String>,
+        /// Build command to run after checkout (default: cargo build)
+        #[arg(long)]
+        build_cmd: Option<String>,
     },
     /// Checkout a branch (assigns a clone, checks out, updates submodules)
     #[command(alias = "ck")]
@@ -63,6 +66,8 @@ enum Commands {
         /// Pool name to remove
         name: String,
     },
+    /// Run the configured build command for the current pool
+    Build,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,6 +83,13 @@ struct PoolConfig {
     base_dir: PathBuf,
     /// GitHub owner/repo for PR lookups (e.g., "category-labs/monad-bft")
     github_repo: Option<String>,
+    /// Build command to run after checkout
+    #[serde(default = "default_build_command")]
+    build_command: String,
+}
+
+fn default_build_command() -> String {
+    "cargo build".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -238,7 +250,12 @@ fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     Ok(!output.stdout.is_empty())
 }
 
-fn cmd_init(repo: Option<String>, base: Option<PathBuf>, name: Option<String>) -> Result<()> {
+fn cmd_init(
+    repo: Option<String>,
+    base: Option<PathBuf>,
+    name: Option<String>,
+    build_cmd: Option<String>,
+) -> Result<()> {
     let cwd = std::env::current_dir()?;
 
     // Determine repo URL
@@ -271,6 +288,7 @@ fn cmd_init(repo: Option<String>, base: Option<PathBuf>, name: Option<String>) -
     };
 
     let github_repo = extract_github_repo(&repo_url);
+    let build_command = build_cmd.unwrap_or_else(default_build_command);
 
     let mut config = load_config()?;
 
@@ -284,6 +302,7 @@ fn cmd_init(repo: Option<String>, base: Option<PathBuf>, name: Option<String>) -
             repo_url,
             base_dir: base_dir.clone(),
             github_repo: github_repo.clone(),
+            build_command: build_command.clone(),
         },
     );
 
@@ -334,7 +353,33 @@ fn cmd_init(repo: Option<String>, base: Option<PathBuf>, name: Option<String>) -
     if let Some(gh) = github_repo {
         eprintln!("  GitHub repo: {}", gh);
     }
+    eprintln!("  Build command: {}", build_command);
     eprintln!("  Clones found: {}", clone_count);
+
+    Ok(())
+}
+
+fn cmd_build() -> Result<()> {
+    let config = load_config()?;
+    let pool_name = detect_pool_from_cwd(&config)?;
+    let pool_config = &config.pools[&pool_name];
+
+    eprintln!("Running: {}", pool_config.build_command);
+
+    let status = if cfg!(target_os = "windows") {
+        Command::new("cmd")
+            .args(["/C", &pool_config.build_command])
+            .status()
+    } else {
+        Command::new("sh")
+            .args(["-c", &pool_config.build_command])
+            .status()
+    }
+    .context("Failed to run build command")?;
+
+    if !status.success() {
+        bail!("Build command failed");
+    }
 
     Ok(())
 }
@@ -662,6 +707,7 @@ fn cmd_pools() -> Result<()> {
         if let Some(gh) = &pool_config.github_repo {
             println!("  GitHub: {}", gh);
         }
+        println!("  Build: {}", pool_config.build_command);
         println!();
     }
 
@@ -688,8 +734,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { repo, base, name } => cmd_init(repo, base, name),
-        Commands::Checkout { branch, no_submodules } => cmd_checkout(branch, no_submodules),
+        Commands::Init {
+            repo,
+            base,
+            name,
+            build_cmd,
+        } => cmd_init(repo, base, name, build_cmd),
+        Commands::Checkout {
+            branch,
+            no_submodules,
+        } => cmd_checkout(branch, no_submodules),
         Commands::Status => cmd_status(),
         Commands::Drop { clone } => cmd_drop(clone),
         Commands::Pr { number } => cmd_pr(number),
@@ -697,5 +751,6 @@ fn main() -> Result<()> {
         Commands::New { name } => cmd_new(name),
         Commands::Pools => cmd_pools(),
         Commands::RmPool { name } => cmd_rm_pool(name),
+        Commands::Build => cmd_build(),
     }
 }

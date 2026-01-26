@@ -11,8 +11,7 @@ rp() {
         if [[ $ret -eq 0 && -d "$output" ]]; then
             cd "$output"
             if [[ "$1" == "ck" || "$1" == "checkout" || "$1" == "pr" ]]; then
-                echo "Building..."
-                cargo build
+                rpool build
             fi
         fi
         return $ret
@@ -28,7 +27,7 @@ if [[ -n "$BASH_VERSION" ]]; then
         local prev="${COMP_WORDS[COMP_CWORD-1]}"
 
         if [[ $COMP_CWORD -eq 1 ]]; then
-            COMPREPLY=($(compgen -W "checkout ck status st drop pr sync new pools rm-pool init" -- "$cur"))
+            COMPREPLY=($(compgen -W "checkout ck status st drop pr sync new pools rm-pool init build" -- "$cur"))
         fi
     }
     complete -F _rp_completions rp
