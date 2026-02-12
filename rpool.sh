@@ -4,32 +4,38 @@
 
 # rp - wrapper for rpool that handles cd and build
 rp() {
-    if [[ "$1" == "ck" || "$1" == "checkout" || "$1" == "pr" || "$1" == "new" ]]; then
+    # Parse args, extracting the subcommand while preserving order
+    local args=()
+    local subcmd=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -p|--pool) args+=("$1" "$2"); shift 2 ;;
+            -*) args+=("$1"); shift ;;
+            *)
+                if [[ -z "$subcmd" ]]; then
+                    subcmd="$1"
+                fi
+                args+=("$1"); shift ;;
+        esac
+    done
+
+    # Commands whose stdout is a path to cd into
+    if [[ "$subcmd" == "ck" || "$subcmd" == "checkout" || "$subcmd" == "pr" || "$subcmd" == "new" || "$subcmd" == "cd" ]]; then
         local output
-        output=$(rpool "$@")
+        output=$(rpool "${args[@]}")
         local ret=$?
         if [[ $ret -eq 0 && -d "$output" ]]; then
             cd "$output"
-            if [[ "$1" == "ck" || "$1" == "checkout" || "$1" == "pr" ]]; then
+            # Auto-build after checkout/pr (not cd/new)
+            if [[ "$subcmd" == "ck" || "$subcmd" == "checkout" || "$subcmd" == "pr" ]]; then
                 rpool build
             fi
         fi
         return $ret
     else
-        rpool "$@"
+        rpool "${args[@]}"
     fi
 }
 
-# Completions for bash
-if [[ -n "$BASH_VERSION" ]]; then
-    _rp_completions() {
-        local cur="${COMP_WORDS[COMP_CWORD]}"
-        local prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-        if [[ $COMP_CWORD -eq 1 ]]; then
-            COMPREPLY=($(compgen -W "checkout ck status st drop pr sync new pools rm-pool init build" -- "$cur"))
-        fi
-    }
-    complete -F _rp_completions rp
-    complete -F _rp_completions rpool
-fi
+# Dynamic completions from the rpool binary
+eval "$(rpool completions bash 2>/dev/null)"
