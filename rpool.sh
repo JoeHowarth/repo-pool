@@ -37,5 +37,16 @@ rp() {
     fi
 }
 
+# Minimal _init_completion shim if bash-completion framework is not loaded
+if [[ -n "$BASH_VERSION" ]] && ! type _init_completion &>/dev/null; then
+    _init_completion() {
+        COMPREPLY=()
+        cur="${COMP_WORDS[COMP_CWORD]}"
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+        words=("${COMP_WORDS[@]}")
+        cword=$COMP_CWORD
+    }
+fi
+
 # Dynamic completions from the rpool binary
 eval "$(rpool completions bash 2>/dev/null)"
