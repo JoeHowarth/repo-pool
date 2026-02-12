@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -163,6 +164,44 @@ fn pool_dir(config: &Config, pool_name: &str) -> PathBuf {
     config.clones_root.join(pool_name)
 }
 
+/// Write to a temp file then rename, so readers never see a partial/corrupt file.
+fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    let pid = std::process::id();
+    let tmp = path.with_extension(format!("tmp.{}", pid));
+    let mut f = std::fs::File::create(&tmp)
+        .with_context(|| format!("Failed to create temp file {}", tmp.display()))?;
+    f.write_all(contents.as_bytes())?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("Failed to rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Validate that a user-supplied name is safe to use as a path component
+/// and in shell contexts (completion, output parsing).
+fn validate_name(name: &str, kind: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("{} name cannot be empty", kind);
+    }
+    if name == ".." || name == "." {
+        bail!("{} name cannot be '{}' ", kind, name);
+    }
+    if name.starts_with('-') {
+        bail!("{} name '{}' must not start with '-'", kind, name);
+    }
+    // Reject path separators, whitespace, control chars, and shell glob chars
+    let bad: &[char] = &['/', '\\', ' ', '\t', '\n', '\r', '*', '?', '[', ']', '{', '}'];
+    if let Some(c) = name.chars().find(|c| bad.contains(c) || c.is_control()) {
+        bail!(
+            "{} name '{}' contains invalid character '{}'",
+            kind,
+            name,
+            c.escape_default()
+        );
+    }
+    Ok(())
+}
+
 fn config_dir() -> Result<PathBuf> {
     let dir = dirs::config_dir()
         .ok_or_else(|| anyhow!("Could not determine config directory"))?
@@ -184,7 +223,7 @@ fn load_config() -> Result<Config> {
 fn save_config(config: &Config) -> Result<()> {
     let path = config_dir()?.join("config.json");
     let contents = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, contents)?;
+    atomic_write(&path, &contents)?;
     Ok(())
 }
 
@@ -201,7 +240,7 @@ fn load_state() -> Result<State> {
 fn save_state(state: &State) -> Result<()> {
     let path = config_dir()?.join("state.json");
     let contents = serde_json::to_string_pretty(state)?;
-    std::fs::write(path, contents)?;
+    atomic_write(&path, &contents)?;
     Ok(())
 }
 
@@ -223,7 +262,7 @@ fn load_branch_cache() -> Result<BranchCache> {
 fn save_branch_cache(cache: &BranchCache) -> Result<()> {
     let path = config_dir()?.join("branch_cache.json");
     let contents = serde_json::to_string_pretty(cache)?;
-    std::fs::write(path, contents)?;
+    atomic_write(&path, &contents)?;
     Ok(())
 }
 
@@ -319,13 +358,22 @@ fn extract_github_repo(url: &str) -> Option<String> {
 }
 
 fn run_git(args: &[&str], cwd: &Path) -> Result<()> {
-    let status = Command::new("git")
+    // Capture git's stdout and forward it to stderr so it doesn't pollute
+    // the stdout path that the shell integration captures for cd.
+    let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .status()
+        .output()
         .with_context(|| format!("Failed to run git {}", args.join(" ")))?;
 
-    if !status.success() {
+    if !output.stdout.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if !output.status.success() {
         bail!("git {} failed", args.join(" "));
     }
     Ok(())
@@ -352,7 +400,16 @@ fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     let output = Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(path)
-        .output()?;
+        .output()
+        .with_context(|| format!("Failed to run git status in {}", path.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git status failed in {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     Ok(!output.stdout.is_empty())
 }
@@ -449,6 +506,8 @@ fn cmd_init(
             url_name.to_string()
         }
     };
+
+    validate_name(&pool_name, "Pool")?;
 
     let github_repo = extract_github_repo(&repo_url);
     let build_command = build_cmd.unwrap_or_else(default_build_command);
@@ -593,50 +652,36 @@ fn cmd_checkout(branch: String, no_submodules: bool, pool: Option<String>) -> Re
         .map(|(name, cs)| (name.clone(), cs.path.clone()));
 
     if let Some((clone_name, path)) = existing {
-        eprintln!("Branch '{}' already on clone: {}", branch, clone_name);
+        // Verify the clone is actually on the recorded branch
+        let actual_branch =
+            run_git_output(&["rev-parse", "--abbrev-ref", "HEAD"], &path).ok();
 
-        // Update last_used
-        pool_state.clones.get_mut(&clone_name).unwrap().last_used = Utc::now();
-        save_state(&state)?;
+        if actual_branch.as_ref() == Some(&branch) {
+            eprintln!("Branch '{}' already on clone: {}", branch, clone_name);
 
-        // Output path for shell integration
-        println!("{}", path.display());
-        return Ok(());
-    }
+            // Update last_used
+            pool_state.clones.get_mut(&clone_name).unwrap().last_used = Utc::now();
+            save_state(&state)?;
 
-    // Find an unassigned clone or the LRU one
-    let clone_name = {
-        // First, look for unassigned clone
-        let unassigned = pool_state
-            .clones
-            .iter()
-            .find(|(_, cs)| cs.assigned_branch.is_none())
-            .map(|(name, _)| name.clone());
-
-        if let Some(name) = unassigned {
-            name
-        } else if !pool_state.clones.is_empty() {
-            // Find LRU clone
-            pool_state
-                .clones
-                .iter()
-                .min_by_key(|(_, cs)| cs.last_used)
-                .map(|(name, _)| name.clone())
-                .unwrap()
-        } else {
-            bail!("No clones in pool. Run 'rpool new' first.");
+            // Output path for shell integration
+            println!("{}", path.display());
+            return Ok(());
         }
-    };
 
-    let path = pool_state.clones[&clone_name].path.clone();
-
-    // Check for uncommitted changes
-    if has_uncommitted_changes(&path)? {
-        bail!(
-            "Clone '{}' has uncommitted changes. Commit or stash them first.",
-            clone_name
+        // State is stale: clone is actually on a different branch. Correct it.
+        eprintln!(
+            "Clone '{}' was recorded as '{}' but is actually on '{}'. Correcting state.",
+            clone_name,
+            branch,
+            actual_branch.as_deref().unwrap_or("unknown"),
         );
+        pool_state.clones.get_mut(&clone_name).unwrap().assigned_branch =
+            actual_branch;
     }
+
+    // Find a clean (unassigned or LRU) clone, skipping dirty ones
+    let clone_name = select_clean_clone(pool_state)?;
+    let path = pool_state.clones[&clone_name].path.clone();
 
     // Find dev config source before we start modifying things
     let dev_config_source = find_dev_config_source(pool_state, &path);
@@ -661,6 +706,13 @@ fn cmd_checkout(branch: String, no_submodules: bool, pool: Option<String>) -> Re
         let _ = run_git(&["pull", "--ff-only"], &path);
     }
 
+    // Update state now that checkout succeeded (before submodules, so state is
+    // correct even if submodule update fails).
+    let clone_state = pool_state.clones.get_mut(&clone_name).unwrap();
+    clone_state.assigned_branch = Some(branch);
+    clone_state.last_used = Utc::now();
+    save_state(&state)?;
+
     if !no_submodules {
         eprintln!("Updating submodules...");
         run_git(&["submodule", "update", "--init", "--recursive"], &path)?;
@@ -673,12 +725,6 @@ fn cmd_checkout(branch: String, no_submodules: bool, pool: Option<String>) -> Re
             eprintln!("  Warning: {}", e);
         }
     }
-
-    // Update state
-    let clone_state = pool_state.clones.get_mut(&clone_name).unwrap();
-    clone_state.assigned_branch = Some(branch);
-    clone_state.last_used = Utc::now();
-    save_state(&state)?;
 
     // Output just the path for shell integration
     println!("{}", path.display());
@@ -721,14 +767,26 @@ fn cmd_status(pool: Option<String>) -> Result<()> {
                 clones.sort_by_key(|(_, cs)| std::cmp::Reverse(cs.last_used));
 
                 for (clone_name, clone_state) in clones {
-                    let branch_display = clone_state
+                    let recorded = clone_state
                         .assigned_branch
                         .as_deref()
                         .unwrap_or("(unassigned)");
-                    let dirty = if has_uncommitted_changes(&clone_state.path).unwrap_or(false) {
-                        " [dirty]"
-                    } else {
-                        ""
+                    // Show actual branch if it differs from recorded state
+                    let actual = run_git_output(
+                        &["rev-parse", "--abbrev-ref", "HEAD"],
+                        &clone_state.path,
+                    )
+                    .ok();
+                    let branch_display = match actual.as_deref() {
+                        Some(actual) if clone_state.assigned_branch.is_some() && actual != recorded => {
+                            format!("{} (actual: {})", recorded, actual)
+                        }
+                        _ => recorded.to_string(),
+                    };
+                    let dirty = match has_uncommitted_changes(&clone_state.path) {
+                        Ok(true) => " [dirty]",
+                        Ok(false) => "",
+                        Err(_) => " [error reading clone]",
                     };
                     println!("  {} -> {}{}", clone_name, branch_display, dirty);
                 }
@@ -800,36 +858,145 @@ fn cmd_pr(number: u64, pool: Option<String>) -> Result<()> {
         github_repo, number
     );
 
+    let mut curl_args = vec![
+        "-s".to_string(),
+        "-L".to_string(),
+        "--fail".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github+json".to_string(),
+    ];
+
+    // Use GITHUB_TOKEN if available (required for private repos and avoids rate limits)
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        curl_args.push("-H".to_string());
+        curl_args.push(format!("Authorization: Bearer {}", token));
+    }
+
+    curl_args.push(url);
+
     let output = Command::new("curl")
-        .args([
-            "-s",
-            "-L",
-            "-H",
-            "Accept: application/vnd.github+json",
-            &url,
-        ])
+        .args(&curl_args)
         .output()
         .context("Failed to fetch PR info")?;
 
     if !output.status.success() {
-        bail!("Failed to fetch PR info");
+        bail!(
+            "Failed to fetch PR #{} (HTTP error). Check that the PR exists and the repo is correct.",
+            number
+        );
     }
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+
+    // Check for API error message
+    if let Some(msg) = json["message"].as_str() {
+        bail!("GitHub API error for PR #{}: {}", number, msg);
+    }
+
     let branch = json["head"]["ref"]
         .as_str()
         .ok_or_else(|| anyhow!("Could not find branch name in PR response"))?;
 
-    eprintln!("PR #{} is on branch: {}", number, branch);
+    // Detect fork PRs: head repo differs from base repo
+    let is_fork = json["head"]["repo"]["full_name"] != json["base"]["repo"]["full_name"];
 
-    // Delegate to checkout, passing pool through
-    cmd_checkout(branch.to_string(), false, Some(pool_name))
+    if is_fork {
+        eprintln!("PR #{} is a fork PR on branch: {}", number, branch);
+        // For fork PRs, fetch via refs/pull/<n>/head since origin won't have the branch
+        checkout_pr_ref(number, branch, &pool_name)
+    } else {
+        eprintln!("PR #{} is on branch: {}", number, branch);
+        cmd_checkout(branch.to_string(), false, Some(pool_name))
+    }
+}
+
+/// Select a clean (no uncommitted changes) clone, preferring unassigned, then LRU.
+fn select_clean_clone(pool_state: &PoolState) -> Result<String> {
+    if pool_state.clones.is_empty() {
+        bail!("No clones in pool. Run 'rpool new' first.");
+    }
+
+    // Prefer unassigned clones, then LRU assigned clones
+    let mut candidates: Vec<(&String, &CloneState)> = pool_state.clones.iter().collect();
+    candidates.sort_by(|(_, a), (_, b)| {
+        // Unassigned first, then by last_used ascending (LRU first)
+        let a_assigned = a.assigned_branch.is_some() as u8;
+        let b_assigned = b.assigned_branch.is_some() as u8;
+        a_assigned.cmp(&b_assigned).then(a.last_used.cmp(&b.last_used))
+    });
+
+    for (name, cs) in &candidates {
+        match has_uncommitted_changes(&cs.path) {
+            Ok(false) => return Ok((*name).clone()),
+            Ok(true) => continue,
+            Err(_) => continue,
+        }
+    }
+
+    bail!(
+        "All clones have uncommitted changes. Commit or stash changes in at least one clone."
+    );
+}
+
+/// Checkout a fork PR by fetching refs/pull/<n>/head directly.
+fn checkout_pr_ref(pr_number: u64, _branch: &str, pool_name: &str) -> Result<()> {
+    let local_branch = format!("pr/{}", pr_number);
+
+    // Reuse existing assignment if this PR is already checked out
+    let mut state = load_state()?;
+    let pool_state = state.pools.entry(pool_name.to_string()).or_default();
+
+    let existing = pool_state
+        .clones
+        .iter()
+        .find(|(_, cs)| cs.assigned_branch.as_deref() == Some(local_branch.as_str()))
+        .map(|(name, cs)| (name.clone(), cs.path.clone()));
+
+    if let Some((clone_name, path)) = existing {
+        eprintln!("PR #{} already on clone: {}", pr_number, clone_name);
+        pool_state.clones.get_mut(&clone_name).unwrap().last_used = Utc::now();
+        save_state(&state)?;
+        println!("{}", path.display());
+        return Ok(());
+    }
+
+    // Find an unassigned clone or LRU, skipping dirty clones
+    let clone_name = select_clean_clone(pool_state)?;
+
+    let path = pool_state.clones[&clone_name].path.clone();
+    let dev_config_source = find_dev_config_source(pool_state, &path);
+
+    eprintln!("Using clone: {}", clone_name);
+    eprintln!("Fetching PR #{}...", pr_number);
+
+    let refspec = format!("refs/pull/{}/head:{}", pr_number, local_branch);
+    run_git(&["fetch", "origin", &refspec], &path)?;
+    run_git(&["checkout", &local_branch], &path)?;
+
+    let clone_state = pool_state.clones.get_mut(&clone_name).unwrap();
+    clone_state.assigned_branch = Some(local_branch);
+    clone_state.last_used = Utc::now();
+    save_state(&state)?;
+
+    eprintln!("Updating submodules...");
+    run_git(&["submodule", "update", "--init", "--recursive"], &path)?;
+
+    if let Some(source) = dev_config_source {
+        eprintln!("Copying dev configs from {}...", source.display());
+        if let Err(e) = copy_dev_configs(&source, &path) {
+            eprintln!("  Warning: {}", e);
+        }
+    }
+
+    println!("{}", path.display());
+    Ok(())
 }
 
 fn cmd_sync() -> Result<()> {
     let config = load_config()?;
     let state = load_state()?;
     let mut cache = load_branch_cache()?;
+    let mut had_errors = false;
 
     for (pool_name, pool_state) in &state.pools {
         if !config.pools.contains_key(pool_name) {
@@ -847,7 +1014,10 @@ fn cmd_sync() -> Result<()> {
                         first_ok_clone = Some(&clone_state.path);
                     }
                 }
-                Err(e) => eprintln!("error: {}", e),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    had_errors = true;
+                }
             }
         }
 
@@ -865,6 +1035,10 @@ fn cmd_sync() -> Result<()> {
 
     save_branch_cache(&cache)?;
 
+    if had_errors {
+        bail!("Some fetches failed (see errors above)");
+    }
+
     Ok(())
 }
 
@@ -880,7 +1054,10 @@ fn cmd_new(name: Option<String>, pool: Option<String>) -> Result<()> {
 
     // Generate clone name
     let clone_name = match name {
-        Some(n) => n,
+        Some(n) => {
+            validate_name(&n, "Clone")?;
+            n
+        }
         None => {
             let mut i = pool_state.clones.len() + 1;
             loop {
@@ -909,21 +1086,33 @@ fn cmd_new(name: Option<String>, pool: Option<String>) -> Result<()> {
     let reference = pool_state.clones.values().next().map(|cs| cs.path.clone());
 
     // Clone with --reference if possible
+    let ref_path_str = reference.as_ref().map(|p| p.to_string_lossy().into_owned());
+    let clone_path_str = clone_path.to_string_lossy().into_owned();
+
     let mut args = vec!["clone"];
-    if let Some(ref_path) = &reference {
+    if let Some(ref rps) = ref_path_str {
         args.push("--reference");
-        args.push(ref_path.to_str().unwrap());
-        eprintln!("  Using reference: {}", ref_path.display());
+        args.push(rps);
+        eprintln!("  Using reference: {}", rps);
     }
     args.push(&pool_config.repo_url);
-    args.push(clone_path.to_str().unwrap());
+    args.push(&clone_path_str);
 
-    let status = Command::new("git")
+    // Capture stdout and forward to stderr so it doesn't pollute the path
+    // that the shell integration captures for cd.
+    let clone_output = Command::new("git")
         .args(&args)
-        .status()
+        .output()
         .context("Failed to run git clone")?;
 
-    if !status.success() {
+    if !clone_output.stdout.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&clone_output.stdout));
+    }
+    if !clone_output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&clone_output.stderr));
+    }
+
+    if !clone_output.status.success() {
         bail!("git clone failed");
     }
 
@@ -1127,13 +1316,13 @@ fn bash_completion_script() -> &'static str {
         return
     fi
 
-    local pool_flag=""
-    [[ -n "$pool_arg" ]] && pool_flag="-p $pool_arg"
+    local -a pool_flag=()
+    [[ -n "$pool_arg" ]] && pool_flag=(-p "$pool_arg")
 
     case "$subcmd" in
-        checkout|ck) COMPREPLY=($(compgen -W "$(rpool $pool_flag complete branches 2>/dev/null)" -- "$cur")) ;;
+        checkout|ck) COMPREPLY=($(compgen -W "$(rpool "${pool_flag[@]}" complete branches 2>/dev/null)" -- "$cur")) ;;
         cd)          COMPREPLY=($(compgen -W "$(rpool complete clones 2>/dev/null)" -- "$cur")) ;;
-        drop)        COMPREPLY=($(compgen -W "$(rpool $pool_flag complete clones 2>/dev/null)" -- "$cur")) ;;
+        drop)        COMPREPLY=($(compgen -W "$(rpool "${pool_flag[@]}" complete clones 2>/dev/null)" -- "$cur")) ;;
         rm-pool)     COMPREPLY=($(compgen -W "$(rpool complete pools 2>/dev/null)" -- "$cur")) ;;
         completions) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
     esac
@@ -1223,14 +1412,17 @@ _rpool "$@"
 fn cmd_rm_pool(name: String) -> Result<()> {
     let mut config = load_config()?;
     let mut state = load_state()?;
+    let mut cache = load_branch_cache()?;
 
     if config.pools.remove(&name).is_none() {
         bail!("Pool '{}' not found", name);
     }
     state.pools.remove(&name);
+    cache.pools.remove(&name);
 
     save_config(&config)?;
     save_state(&state)?;
+    save_branch_cache(&cache)?;
 
     eprintln!("Removed pool '{}' (clones on disk are preserved)", name);
     Ok(())
@@ -1250,7 +1442,10 @@ fn cmd_migrate(keep: Option<String>, clones_root_override: Option<PathBuf>) -> R
 
     eprintln!("Migrating to clones root: {}", clones_root.display());
 
-    for (pool_name, pool_state) in &mut state.pools {
+    // Collect rename operations: (pool_name, clone_name, new_path, needs_rename)
+    let mut ops: Vec<(String, String, PathBuf, bool)> = Vec::new();
+
+    for (pool_name, pool_state) in &state.pools {
         if !config.pools.contains_key(pool_name) {
             continue;
         }
@@ -1258,12 +1453,11 @@ fn cmd_migrate(keep: Option<String>, clones_root_override: Option<PathBuf>) -> R
         let pd = clones_root.join(pool_name);
         std::fs::create_dir_all(&pd)?;
 
-        // Determine which clone to keep in place (default: clone whose name == pool name)
         let keep_name = keep.clone().unwrap_or_else(|| pool_name.clone());
 
         eprintln!("\nPool: {}", pool_name);
 
-        for (clone_name, clone_state) in &mut pool_state.clones {
+        for (clone_name, clone_state) in &pool_state.clones {
             if *clone_name == keep_name {
                 eprintln!(
                     "  {} -> kept in place ({})",
@@ -1299,7 +1493,7 @@ fn cmd_migrate(keep: Option<String>, clones_root_override: Option<PathBuf>) -> R
                     clone_name,
                     clone_state.path.display()
                 );
-                clone_state.path = new_path;
+                ops.push((pool_name.clone(), clone_name.clone(), new_path, false));
                 continue;
             }
 
@@ -1309,21 +1503,35 @@ fn cmd_migrate(keep: Option<String>, clones_root_override: Option<PathBuf>) -> R
                 clone_state.path.display(),
                 new_path.display()
             );
-            std::fs::rename(&clone_state.path, &new_path)
-                .with_context(|| {
-                    format!(
-                        "Failed to move {} -> {}",
-                        clone_state.path.display(),
-                        new_path.display()
-                    )
-                })?;
-            clone_state.path = new_path;
+            ops.push((pool_name.clone(), clone_name.clone(), new_path, true));
         }
+    }
+
+    // Execute renames, saving state after each so partial failures are recoverable
+    for (pool_name, clone_name, new_path, needs_rename) in ops {
+        if needs_rename {
+            let old_path = &state.pools[&pool_name].clones[&clone_name].path;
+            std::fs::rename(old_path, &new_path).with_context(|| {
+                format!(
+                    "Failed to move {} -> {}",
+                    old_path.display(),
+                    new_path.display()
+                )
+            })?;
+        }
+        state
+            .pools
+            .get_mut(&pool_name)
+            .unwrap()
+            .clones
+            .get_mut(&clone_name)
+            .unwrap()
+            .path = new_path;
+        save_state(&state)?;
     }
 
     // base_dir is dropped on save via skip_serializing
     save_config(&config)?;
-    save_state(&state)?;
 
     eprintln!("\nMigration complete.");
     Ok(())
