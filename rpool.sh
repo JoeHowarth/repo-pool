@@ -4,6 +4,15 @@
 
 # rp - wrapper for rpool that handles cd and build
 rp() {
+    # Check for previous background build failure
+    local _build_failed_marker="$HOME/.config/rpool/build_failed"
+    if [[ -f "$_build_failed_marker" ]]; then
+        local _fail_log
+        _fail_log=$(<"$_build_failed_marker")
+        echo "Warning: previous background build failed. Log: $_fail_log" >&2
+        rm -f "$_build_failed_marker"
+    fi
+
     # Parse args, extracting the subcommand while preserving order
     local args=()
     local subcmd=""
@@ -34,7 +43,16 @@ rp() {
                 cd "$output"
                 # Auto-build after checkout/pr (not cd/new), in background
                 if [[ "$subcmd" == "ck" || "$subcmd" == "checkout" || "$subcmd" == "pr" ]]; then
-                    rpool build &>/dev/null &
+                    local _build_log
+                    _build_log=$(mktemp /tmp/rpool-build-XXXXXX.log)
+                    (
+                        if rpool build >"$_build_log" 2>&1; then
+                            rm -f "$_build_log"
+                        else
+                            mkdir -p "$HOME/.config/rpool"
+                            echo "$_build_log" > "$HOME/.config/rpool/build_failed"
+                        fi
+                    ) &
                     disown
                 fi
             else

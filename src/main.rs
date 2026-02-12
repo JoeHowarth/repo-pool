@@ -1,11 +1,38 @@
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Advisory file lock around state.json read-modify-write cycles.
+/// The lock is held for the lifetime of this struct and released on Drop.
+struct StateLock {
+    _file: File,
+}
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        // unlock is best-effort; the OS releases the lock when the fd is closed anyway
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
+/// Acquire an exclusive advisory lock on `~/.config/rpool/state.lock`.
+/// Blocks until the lock is available. Returns a guard that releases
+/// the lock when dropped.
+fn lock_state() -> Result<StateLock> {
+    let lock_path = config_dir()?.join("state.lock");
+    let file = File::create(&lock_path)
+        .with_context(|| format!("Failed to create lock file {}", lock_path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("Failed to acquire lock on {}", lock_path.display()))?;
+    Ok(StateLock { _file: file })
+}
 
 #[derive(Parser)]
 #[command(name = "rpool", about = "Manage a pool of repository clones")]
@@ -98,6 +125,22 @@ enum Commands {
         #[arg(long)]
         clones_root: Option<PathBuf>,
     },
+    /// Pin a clone so it is deprioritized for automatic assignment
+    Pin {
+        /// Clone name to pin (default: current)
+        clone: Option<String>,
+    },
+    /// Unpin a clone so it can be freely assigned again
+    Unpin {
+        /// Clone name to unpin (default: current)
+        clone: Option<String>,
+    },
+    /// Diagnose and optionally fix inconsistencies between state and filesystem
+    Doctor {
+        /// Automatically fix problems that can be resolved
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 fn default_clones_root() -> PathBuf {
@@ -157,6 +200,8 @@ struct CloneState {
     path: PathBuf,
     assigned_branch: Option<String>,
     last_used: DateTime<Utc>,
+    #[serde(default)]
+    pinned: bool,
 }
 
 /// Compute the directory for a pool's clones under the global clones_root.
@@ -557,6 +602,7 @@ fn cmd_init(
                             path: cwd.clone(),
                             assigned_branch: branch,
                             last_used: Utc::now(),
+                            pinned: false,
                         },
                     );
                     eprintln!("  Registered current repo as clone: {}", clone_name);
@@ -583,6 +629,7 @@ fn cmd_init(
                                     path: path.clone(),
                                     assigned_branch: branch,
                                     last_used: Utc::now(),
+                                    pinned: false,
                                 },
                             );
                             eprintln!("  Found existing clone: {}", clone_name);
@@ -636,12 +683,9 @@ fn cmd_build(pool: Option<String>) -> Result<()> {
 
 fn cmd_checkout(branch: String, no_submodules: bool, pool: Option<String>) -> Result<()> {
     let config = load_config()?;
-    let state = load_state()?;
+    let mut state = load_state()?;
     let pool_name = resolve_pool(&config, &state, pool.as_deref())?;
     let _pool_config = &config.pools[&pool_name];
-    drop(state);
-
-    let mut state = load_state()?;
     let pool_state = state.pools.entry(pool_name.clone()).or_default();
 
     // Check if branch is already assigned to a clone
@@ -658,6 +702,23 @@ fn cmd_checkout(branch: String, no_submodules: bool, pool: Option<String>) -> Re
 
         if actual_branch.as_ref() == Some(&branch) {
             eprintln!("Branch '{}' already on clone: {}", branch, clone_name);
+
+            // Pull latest before returning
+            eprintln!("Pulling latest...");
+            if let Err(e) = run_git(&["fetch", "origin"], &path) {
+                eprintln!("Warning: fetch failed: {}", e);
+            }
+            if let Err(e) = run_git(&["pull", "--ff-only"], &path) {
+                eprintln!("Warning: pull failed: {}", e);
+            }
+
+            // Update submodules on fast path too
+            if !no_submodules {
+                eprintln!("Updating submodules...");
+                if let Err(e) = run_git(&["submodule", "update", "--init", "--recursive"], &path) {
+                    eprintln!("Warning: submodule update failed: {}", e);
+                }
+            }
 
             // Update last_used
             pool_state.clones.get_mut(&clone_name).unwrap().last_used = Utc::now();
@@ -783,12 +844,20 @@ fn cmd_status(pool: Option<String>) -> Result<()> {
                         }
                         _ => recorded.to_string(),
                     };
+                    let pinned_marker = if clone_state.pinned {
+                        " [pinned]"
+                    } else {
+                        ""
+                    };
                     let dirty = match has_uncommitted_changes(&clone_state.path) {
                         Ok(true) => " [dirty]",
                         Ok(false) => "",
                         Err(_) => " [error reading clone]",
                     };
-                    println!("  {} -> {}{}", clone_name, branch_display, dirty);
+                    println!(
+                        "  {} -> {}{}{}",
+                        clone_name, branch_display, pinned_marker, dirty
+                    );
                 }
             }
         } else {
@@ -802,11 +871,8 @@ fn cmd_status(pool: Option<String>) -> Result<()> {
 
 fn cmd_drop(clone: Option<String>, pool: Option<String>) -> Result<()> {
     let config = load_config()?;
-    let state_for_resolve = load_state()?;
-    let pool_name = resolve_pool(&config, &state_for_resolve, pool.as_deref())?;
-    drop(state_for_resolve);
-
     let mut state = load_state()?;
+    let pool_name = resolve_pool(&config, &state, pool.as_deref())?;
     let pool_state = state.pools.entry(pool_name.clone()).or_default();
 
     let clone_name = match clone {
@@ -916,13 +982,16 @@ fn select_clean_clone(pool_state: &PoolState) -> Result<String> {
         bail!("No clones in pool. Run 'rpool new' first.");
     }
 
-    // Prefer unassigned clones, then LRU assigned clones
+    // Prefer unassigned clones, then LRU assigned clones.
+    // Within each group, deprioritize pinned clones (unpinned first).
     let mut candidates: Vec<(&String, &CloneState)> = pool_state.clones.iter().collect();
     candidates.sort_by(|(_, a), (_, b)| {
-        // Unassigned first, then by last_used ascending (LRU first)
         let a_assigned = a.assigned_branch.is_some() as u8;
         let b_assigned = b.assigned_branch.is_some() as u8;
-        a_assigned.cmp(&b_assigned).then(a.last_used.cmp(&b.last_used))
+        a_assigned
+            .cmp(&b_assigned)
+            .then((a.pinned as u8).cmp(&(b.pinned as u8)))
+            .then(a.last_used.cmp(&b.last_used))
     });
 
     for (name, cs) in &candidates {
@@ -1044,12 +1113,9 @@ fn cmd_sync() -> Result<()> {
 
 fn cmd_new(name: Option<String>, pool: Option<String>) -> Result<()> {
     let config = load_config()?;
-    let state_for_resolve = load_state()?;
-    let pool_name = resolve_pool(&config, &state_for_resolve, pool.as_deref())?;
-    let pool_config = &config.pools[&pool_name];
-    drop(state_for_resolve);
-
     let mut state = load_state()?;
+    let pool_name = resolve_pool(&config, &state, pool.as_deref())?;
+    let pool_config = &config.pools[&pool_name];
     let pool_state = state.pools.entry(pool_name.clone()).or_default();
 
     // Generate clone name
@@ -1130,6 +1196,7 @@ fn cmd_new(name: Option<String>, pool: Option<String>) -> Result<()> {
             path: clone_path.clone(),
             assigned_branch: None,
             last_used: Utc::now(),
+            pinned: false,
         },
     );
     save_state(&state)?;
@@ -1312,7 +1379,7 @@ fn bash_completion_script() -> &'static str {
     fi
 
     if [[ -z "$subcmd" ]]; then
-        COMPREPLY=($(compgen -W "init checkout ck status st drop pr sync new pools rm-pool build cd migrate completions" -- "$cur"))
+        COMPREPLY=($(compgen -W "init checkout ck status st drop pr sync new pools rm-pool build cd migrate pin unpin doctor completions" -- "$cur"))
         return
     fi
 
@@ -1323,6 +1390,8 @@ fn bash_completion_script() -> &'static str {
         checkout|ck) COMPREPLY=($(compgen -W "$(rpool "${pool_flag[@]}" complete branches 2>/dev/null)" -- "$cur")) ;;
         cd)          COMPREPLY=($(compgen -W "$(rpool complete clones 2>/dev/null)" -- "$cur")) ;;
         drop)        COMPREPLY=($(compgen -W "$(rpool "${pool_flag[@]}" complete clones 2>/dev/null)" -- "$cur")) ;;
+        pin)         COMPREPLY=($(compgen -W "$(rpool "${pool_flag[@]}" complete clones 2>/dev/null)" -- "$cur")) ;;
+        unpin)       COMPREPLY=($(compgen -W "$(rpool "${pool_flag[@]}" complete clones 2>/dev/null)" -- "$cur")) ;;
         rm-pool)     COMPREPLY=($(compgen -W "$(rpool complete pools 2>/dev/null)" -- "$cur")) ;;
         completions) COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur")) ;;
     esac
@@ -1350,6 +1419,9 @@ _rpool() {
         'build:Run build command'
         'cd:Navigate to a clone'
         'migrate:Migrate clones to structured directory'
+        'pin:Pin a clone to deprioritize it for assignment'
+        'unpin:Unpin a clone for free assignment'
+        'doctor:Diagnose and fix state inconsistencies'
         'completions:Generate shell completions'
     )
 
@@ -1387,7 +1459,7 @@ _rpool() {
                     clones=(${(f)"$(rpool complete clones 2>/dev/null)"})
                     compadd -a clones
                     ;;
-                drop)
+                drop|pin|unpin)
                     local -a clones
                     clones=(${(f)"$(rpool ${=pool_flag} complete clones 2>/dev/null)"})
                     compadd -a clones
@@ -1407,6 +1479,76 @@ _rpool() {
 
 _rpool "$@"
 "#
+}
+
+fn cmd_pin(clone: Option<String>, pool: Option<String>) -> Result<()> {
+    let config = load_config()?;
+    let mut state = load_state()?;
+    let pool_name = resolve_pool(&config, &state, pool.as_deref())?;
+    let pool_state = state.pools.entry(pool_name.clone()).or_default();
+
+    let clone_name = match clone {
+        Some(name) => name,
+        None => {
+            let cwd = std::env::current_dir()?;
+            pool_state
+                .clones
+                .iter()
+                .find(|(_, cs)| cwd.starts_with(&cs.path))
+                .map(|(name, _)| name.clone())
+                .ok_or_else(|| anyhow!("Not in a clone directory. Specify clone name."))?
+        }
+    };
+
+    let clone_state = pool_state
+        .clones
+        .get_mut(&clone_name)
+        .ok_or_else(|| anyhow!("Clone '{}' not found", clone_name))?;
+
+    if clone_state.pinned {
+        eprintln!("Clone '{}' is already pinned", clone_name);
+    } else {
+        clone_state.pinned = true;
+        save_state(&state)?;
+        eprintln!("Pinned clone '{}'", clone_name);
+    }
+
+    Ok(())
+}
+
+fn cmd_unpin(clone: Option<String>, pool: Option<String>) -> Result<()> {
+    let config = load_config()?;
+    let mut state = load_state()?;
+    let pool_name = resolve_pool(&config, &state, pool.as_deref())?;
+    let pool_state = state.pools.entry(pool_name.clone()).or_default();
+
+    let clone_name = match clone {
+        Some(name) => name,
+        None => {
+            let cwd = std::env::current_dir()?;
+            pool_state
+                .clones
+                .iter()
+                .find(|(_, cs)| cwd.starts_with(&cs.path))
+                .map(|(name, _)| name.clone())
+                .ok_or_else(|| anyhow!("Not in a clone directory. Specify clone name."))?
+        }
+    };
+
+    let clone_state = pool_state
+        .clones
+        .get_mut(&clone_name)
+        .ok_or_else(|| anyhow!("Clone '{}' not found", clone_name))?;
+
+    if !clone_state.pinned {
+        eprintln!("Clone '{}' is not pinned", clone_name);
+    } else {
+        clone_state.pinned = false;
+        save_state(&state)?;
+        eprintln!("Unpinned clone '{}'", clone_name);
+    }
+
+    Ok(())
 }
 
 fn cmd_rm_pool(name: String) -> Result<()> {
@@ -1537,32 +1679,283 @@ fn cmd_migrate(keep: Option<String>, clones_root_override: Option<PathBuf>) -> R
     Ok(())
 }
 
+fn cmd_doctor(fix: bool, pool: Option<String>) -> Result<()> {
+    let config = load_config()?;
+    let mut state = load_state()?;
+    let mut issues: usize = 0;
+    let mut fixed: usize = 0;
+
+    // If -p was given, scope checks to that single pool
+    let scoped_pool: Option<String> = match pool {
+        Some(ref name) => {
+            if !config.pools.contains_key(name) {
+                bail!("Pool '{}' not found", name);
+            }
+            Some(name.clone())
+        }
+        None => None,
+    };
+
+    // Track clone names to remove after iteration (cannot mutate while iterating)
+    let mut clones_to_remove: Vec<(String, String)> = Vec::new();
+    // Track branch updates to apply after iteration
+    let mut branch_updates: Vec<(String, String, Option<String>)> = Vec::new();
+
+    // 1. Check for orphaned state entries (pool in state but not in config)
+    //    Only when running globally (no -p filter)
+    let orphaned_pools: Vec<String> = if scoped_pool.is_none() {
+        state
+            .pools
+            .keys()
+            .filter(|p| !config.pools.contains_key(*p))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    for pool_name in &orphaned_pools {
+        issues += 1;
+        eprintln!(
+            "WARN: pool '{}' exists in state but not in config (orphaned)",
+            pool_name
+        );
+        if fix {
+            state.pools.remove(pool_name);
+            fixed += 1;
+            eprintln!("  FIXED: removed orphaned pool '{}' from state", pool_name);
+        }
+    }
+
+    // 2. Walk all pools in config, check their clones in state
+    for (pool_name, pool_config) in &config.pools {
+        // If scoped to a single pool, skip others
+        if let Some(ref scoped) = scoped_pool {
+            if pool_name != scoped {
+                continue;
+            }
+        }
+        let pool_state = match state.pools.get(pool_name) {
+            Some(ps) => ps,
+            None => continue, // no state for this pool, nothing to check
+        };
+
+        // Track branches for duplicate detection within this pool
+        let mut branch_owners: HashMap<String, Vec<String>> = HashMap::new();
+
+        for (clone_name, clone_state) in &pool_state.clones {
+            // 2a. Check if clone path exists on disk
+            if !clone_state.path.exists() {
+                issues += 1;
+                eprintln!(
+                    "WARN: [{}/{}] path does not exist: {}",
+                    pool_name,
+                    clone_name,
+                    clone_state.path.display()
+                );
+                if fix {
+                    clones_to_remove.push((pool_name.clone(), clone_name.clone()));
+                    fixed += 1;
+                    eprintln!(
+                        "  FIXED: removed clone '{}' from pool '{}' state",
+                        clone_name, pool_name
+                    );
+                }
+                continue; // skip further checks for missing clones
+            }
+
+            // 2b. Check actual git branch vs assigned_branch
+            if let Some(ref assigned) = clone_state.assigned_branch {
+                match run_git_output(&["rev-parse", "--abbrev-ref", "HEAD"], &clone_state.path) {
+                    Ok(actual) => {
+                        if actual != *assigned {
+                            issues += 1;
+                            eprintln!(
+                                "WARN: [{}/{}] branch mismatch: state says '{}', actual is '{}'",
+                                pool_name, clone_name, assigned, actual
+                            );
+                            if fix {
+                                let new_branch = if actual == "HEAD" {
+                                    // Detached HEAD, clear the assignment
+                                    None
+                                } else {
+                                    Some(actual)
+                                };
+                                branch_updates.push((
+                                    pool_name.clone(),
+                                    clone_name.clone(),
+                                    new_branch.clone(),
+                                ));
+                                fixed += 1;
+                                eprintln!(
+                                    "  FIXED: updated [{}/{}] branch to '{}'",
+                                    pool_name,
+                                    clone_name,
+                                    new_branch.as_deref().unwrap_or("(unassigned)")
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        issues += 1;
+                        eprintln!(
+                            "WARN: [{}/{}] could not read branch: {}",
+                            pool_name, clone_name, e
+                        );
+                    }
+                }
+            }
+
+            // 2c. Check clone remote URL matches pool's repo_url
+            match get_remote_url(&clone_state.path) {
+                Ok(actual_url) => {
+                    if actual_url != pool_config.repo_url {
+                        issues += 1;
+                        eprintln!(
+                            "WARN: [{}/{}] remote URL mismatch: pool expects '{}', clone has '{}'",
+                            pool_name, clone_name, pool_config.repo_url, actual_url
+                        );
+                    }
+                }
+                Err(e) => {
+                    issues += 1;
+                    eprintln!(
+                        "WARN: [{}/{}] could not read remote URL: {}",
+                        pool_name, clone_name, e
+                    );
+                }
+            }
+
+            // Collect branch assignments for duplicate detection
+            if let Some(ref branch) = clone_state.assigned_branch {
+                branch_owners
+                    .entry(branch.clone())
+                    .or_default()
+                    .push(clone_name.clone());
+            }
+        }
+
+        // 2d. Check for duplicate branch assignments
+        for (branch, owners) in &branch_owners {
+            if owners.len() > 1 {
+                issues += 1;
+                eprintln!(
+                    "WARN: [{}] branch '{}' is assigned to multiple clones: {}",
+                    pool_name,
+                    branch,
+                    owners.join(", ")
+                );
+            }
+        }
+    }
+
+    // Apply deferred mutations
+    for (pool_name, clone_name) in clones_to_remove {
+        if let Some(ps) = state.pools.get_mut(&pool_name) {
+            ps.clones.remove(&clone_name);
+        }
+    }
+    for (pool_name, clone_name, new_branch) in branch_updates {
+        if let Some(ps) = state.pools.get_mut(&pool_name) {
+            if let Some(cs) = ps.clones.get_mut(&clone_name) {
+                cs.assigned_branch = new_branch;
+            }
+        }
+    }
+
+    if fix && fixed > 0 {
+        save_state(&state)?;
+    }
+
+    // Print summary
+    eprintln!();
+    if issues == 0 {
+        eprintln!("No issues found.");
+    } else if fix {
+        eprintln!("{} issue(s) found, {} fixed.", issues, fixed);
+        let unfixed = issues - fixed;
+        if unfixed > 0 {
+            eprintln!(
+                "{} issue(s) require manual intervention.",
+                unfixed
+            );
+        }
+    } else {
+        eprintln!(
+            "{} issue(s) found. Run with --fix to auto-repair what can be fixed.",
+            issues
+        );
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let pool = cli.pool;
 
+    // Commands that modify state.json acquire an exclusive advisory lock
+    // before any load_state() call and hold it until the command finishes.
+    // Read-only commands (Status, Complete, Cd, Pools, Build, Completions)
+    // skip the lock.
     match cli.command {
         Commands::Init {
             repo,
             clones_root,
             name,
             build_cmd,
-        } => cmd_init(repo, clones_root, name, build_cmd),
+        } => {
+            let _lock = lock_state()?;
+            cmd_init(repo, clones_root, name, build_cmd)
+        }
         Commands::Checkout {
             branch,
             no_submodules,
-        } => cmd_checkout(branch, no_submodules, pool),
+        } => {
+            let _lock = lock_state()?;
+            cmd_checkout(branch, no_submodules, pool)
+        }
         Commands::Status => cmd_status(pool),
-        Commands::Drop { clone } => cmd_drop(clone, pool),
-        Commands::Pr { number } => cmd_pr(number, pool),
-        Commands::Sync => cmd_sync(),
-        Commands::New { name } => cmd_new(name, pool),
+        Commands::Drop { clone } => {
+            let _lock = lock_state()?;
+            cmd_drop(clone, pool)
+        }
+        Commands::Pr { number } => {
+            let _lock = lock_state()?;
+            cmd_pr(number, pool)
+        }
+        Commands::Sync => {
+            let _lock = lock_state()?;
+            cmd_sync()
+        }
+        Commands::New { name } => {
+            let _lock = lock_state()?;
+            cmd_new(name, pool)
+        }
         Commands::Pools => cmd_pools(),
-        Commands::RmPool { name } => cmd_rm_pool(name),
+        Commands::RmPool { name } => {
+            let _lock = lock_state()?;
+            cmd_rm_pool(name)
+        }
         Commands::Build => cmd_build(pool),
         Commands::Cd { name } => cmd_cd(name, pool),
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Complete { kind } => cmd_complete(kind, pool),
-        Commands::Migrate { keep, clones_root } => cmd_migrate(keep, clones_root),
+        Commands::Migrate { keep, clones_root } => {
+            let _lock = lock_state()?;
+            cmd_migrate(keep, clones_root)
+        }
+        Commands::Pin { clone } => {
+            let _lock = lock_state()?;
+            cmd_pin(clone, pool)
+        }
+        Commands::Unpin { clone } => {
+            let _lock = lock_state()?;
+            cmd_unpin(clone, pool)
+        }
+        Commands::Doctor { fix } => {
+            let _lock = lock_state()?;
+            cmd_doctor(fix, pool)
+        }
     }
 }
